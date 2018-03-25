@@ -2,5 +2,5 @@ This repository contains the simulation implementation used by Woods et al., "Fa
 
 Example usage can be found in `example.py`.  Main algorithms contained in `sslca/sslca.pyx`.  To get results like in the paper, plug in your favorite CIFAR-10 loader rather than the hand-crafted train / test samples.
 
-Requires at least cython, numpy, scikit-learn, and scipy.
+Requires at least cython, matploblib, numpy, scikit-learn, and scipy.
 

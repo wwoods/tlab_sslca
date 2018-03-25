@@ -1,7 +1,19 @@
 
 from sslca import LcaSpikingWoodsAnalyticalInhibition
 
+import matplotlib.pyplot
 import numpy as np
+
+FM_FONT_SIZE = 8
+matplotlib.rc('font', size=FM_FONT_SIZE)
+matplotlib.pyplot.rcParams.update({
+        'figure.dpi': 300,
+        'font.size': FM_FONT_SIZE,
+        'image.cmap': 'viridis',
+        'legend.fontsize': FM_FONT_SIZE,
+        'text.latex.unicode': True,
+        'text.usetex': True,
+})
 
 def main():
     """The SSLCA implementation expects a dataset which can be indexed as
@@ -13,9 +25,9 @@ def main():
             [1., 1., 0., 0.],
             [0., 0., 1., 1.],
             [1., 1., 1., 1.],
-            [1., 2., 1., 0.],
-            [0., 1., 2., 1.],
-            [0., 2., 2., 0.],
+            [0.5, 1., 0.5, 0.],
+            [0., 0.5, 1., 0.5],
+            [0., 0.5, 0.5, 0.],
     ])
     test = np.asarray([
             [1., 1., 0., 0.],
@@ -39,6 +51,20 @@ def main():
             / (train.shape[0] * train.shape[1])) ** 0.5)))
     print("Test RMSE: {}".format(((((net.reconstruct(test) - test) ** 2).sum()
             / (test.shape[0] * test.shape[1])) ** 0.5)))
+
+    # Demonstration of spike timing
+    net = LcaSpikingWoodsAnalyticalInhibition(
+            nOutputs=2,
+            algSpikes=10,
+            rfAvg=0.5,  # Best set to true data set average (including any bias;
+                        # should not be close to rMin / rMax!)
+            trainWithZero=True,
+    )
+    net.init(4, 2)
+    net.crossbar_ = np.asarray([[1., 1., 0, 0], [0, 0, 1, 1]]).swapaxes(0, 1).copy()
+    net.debugSpikesTo = ((4,1,1), 'spiketest{}.png')
+    net.predict(np.asarray([[0., 1, 0.5, 0.5]]), debug=True)
+    net.debugSpikesTo = None
 
 
 

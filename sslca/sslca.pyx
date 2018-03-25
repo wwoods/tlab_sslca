@@ -273,6 +273,11 @@ from .adadelta cimport AdaDelta
 from .modelBase cimport SklearnModelBase
 from .util cimport FastRandom
 
+import collections
+import matplotlib
+import matplotlib.image
+import matplotlib.pyplot as plt
+import matplotlib.transforms
 import numpy as np
 import scipy
 import scipy.optimize
@@ -420,8 +425,9 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
         defaults = {
                 'nOutputs': nOutputs,
                 'algSpikes': 10.,
-                'algTInSpike': 0.2e-9,
-                'algTInMinGap': 0.2e-9,
+                'algTInSpike': 0.4e-9,
+                'algTInMinGap': 0.4e-9,  # A bit of a misnomer; the average gap
+                                         # between spikes for an input of 1.0
                 'algTOutAccum': 0.8e-9,
                 'algTOutSpike': 0.2e-9,
                 'homeoRate': 5.,  # Set to <= 0 to disable homeostasis
@@ -750,7 +756,7 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
     @cython.cdivision(True)
     cpdef _predict(self, double[::1] x, double[::1] y):
         ## Local temporaries
-        cdef int i, j
+        cdef int i, j, k, m
         cdef double Q, u, u2, u3, u4
         cdef double inhibMult, inhibE
         cdef double dt
@@ -767,6 +773,10 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
         cdef list debugSpikesInputsW
         cdef double[::1] debugBufInputs, debugBufInputsW
         cdef np.uint8_t[:, :, :] debugImgData
+        cdef double debugEventResolution
+        cdef double debugEventLast
+        cdef double[::1] debugSpikesDt
+        cdef double[:, ::1] debugSpikesVolts
 
         cdef float debugE = 0.  # Debug energy
         cdef int debugNSteps = 0
@@ -781,6 +791,17 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
             debugSpikesInputsW = []
             debugBufInputs = np.zeros(self.nInputs)
             debugBufInputsW = np.zeros(self.nInputs)
+
+            # For simulation speed, voltages are recorded at the given resolution
+            # only
+            # Events:
+            #  in{}spike: Times of input spikes.
+            #  out{}spike: Times of output spikes.
+            #  volt: Voltage of input inhibition / output state capacitors.
+            debugEventResolution = 0.1 * min(self.algTOutAccum,
+                    self.algTOutSpike, self.algTInSpike)
+            debugEventLast = -debugEventResolution
+            debugEvents = collections.defaultdict(list)
 
         ## Local mirror of relevant physical constants
         cdef int nInputs = self.nInputs
@@ -822,6 +843,8 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
         cdef double[:] T_inGapRand = np.zeros(nInputs)
         for i in range(nInputs):
             # Period of one input spike event at full capacity
+            # Want T_inSpike / (T_inSpike + gap) = K_maxIn * x[i]
+            # gap = T_inSpike / (K_maxIn * x[i]) - T_inSpike
             u = T_inSpike / (K_maxIn * max(1e-4, x[i]))
             T_inGapRand[i] = 2. * (u - T_inSpike)
 
@@ -948,6 +971,25 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
             # Ensure there are no zero-time updates
             dt += min(T_inSpike, T_outSpike) * 1e-8
 
+            if debugSpikes:
+                # Determine which time steps require a voltage trace.
+                a = []
+                u = debugEventLast
+                while True:
+                    u += debugEventResolution
+                    if u - t <= dt:
+                        a.append(u - t)
+                        debugEventLast = u
+                    else:
+                        break
+                if len(a) > 0:
+                    debugSpikesDt = np.asarray(a)
+                else:
+                    debugSpikesDt = None
+                debugSpikesVolts = np.zeros((len(a), nInputs + nOutputs))
+                debugEvents['volt'].append(debugSpikesVolts)
+
+            ### Input spikes / inhibition behavior
             if useInhib:
                 # Update inhibition first as regardless of spike, the fall time
                 # is the same.
@@ -955,6 +997,15 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                 if debug:
                     inhibE = C_i * 0.5 * (1. - exp(2*dt*negBI))
                 for i in range(nInputs):
+                    if debugSpikes:
+                        # Input voltage trace.
+                        for j in range(debugSpikesVolts.shape[0]):
+                            u = 1.
+                            if inState[i] <= T_inSpike:
+                                # spiking
+                                u = exp(debugSpikesDt[j] * negBI)
+                            debugSpikesVolts[j, i] = Vinhib[i] * u
+
                     if inState[i] > T_inSpike:
                         # Not spiking
                         continue
@@ -976,6 +1027,11 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                         # Not spiking
                         continue
                     debugBufInputs[i] += dt
+
+                    if debugSpikes:
+                        # No voltage trace.
+                        for j in range(debugSpikesVolts.shape[0]):
+                            debugSpikesVolts[j, i] = 0.
 
             # Charge all neurons according to dt, log spikes
             hadSpike = -1
@@ -1013,6 +1069,13 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                                 - 1./u2 * (u*u4 - 1.5*u**2 - 2*u3*u4 + 2*u3*u
                                     + 0.5*u4**2))
 
+                if debugSpikes:
+                    # Log the voltage trace for this node
+                    for j in range(debugSpikesVolts.shape[0]):
+                        u3 = exp(u2 * debugSpikesDt[j])
+                        debugSpikesVolts[j, nInputs + i] = (
+                                u * (1. - u3) + Vnode[i] * u3)
+
                 # Out of debugging, change u2 to be its exponent
                 u2 = exp(u2 * dt)
                 Vnode[i] = u * (1. - u2) + Vnode[i] * u2
@@ -1032,6 +1095,9 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                 # spiking because when multiple spikes happen, inhibition
                 # should still only be updated once
                 hadSpike = i
+
+                if debugSpikes:
+                    debugEvents['out' + str(i) + 'spike'].append(t + dt)
 
                 y[i] += 1.
                 if homeoInUse:
@@ -1064,18 +1130,40 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                 if variabilityRead > 0:
                     updateReadConductances = True
 
+                if debugSpikes:
+                    # Need to count out T_outSpike more time.
+                    a = []
+                    u = debugEventLast
+                    while True:
+                        u += debugEventResolution
+                        if u - (t + dt) <= T_outSpike:
+                            a.append(u - (t + dt))
+                            debugEventLast = u
+                        else:
+                            break
+                    if len(a) > 0:
+                        debugSpikesDt = np.asarray(a)
+                    else:
+                        debugSpikesDt = None
+                    debugSpikesVolts = np.zeros((len(a), nInputs + nOutputs))
+                    debugEvents['volt'].append(debugSpikesVolts)
+
                 # No more voltages; they were all reset
                 Vnode[:] = 0.
                 for j in range(nInputs):
                     if useInhib:
                         u2 = 1. / fireCond[j]  # R_{cb}
-                        u = exp(-T_outSpike / (C_i * u2))  # e^{-T_{spike}A}
 
                         if debug:
                             debugE += 0.5 * C_i * (vcc - Vinhib[j]) ** 2 * (
                                     1. - exp(
                                         -2*T_outSpike * fireCond[j] / C_i))
+                        if debugSpikes:
+                            for i in range(debugSpikesDt.shape[0]):
+                                u = exp(-debugSpikesDt[i] / (C_i * u2))
+                                debugSpikesVolts[i, j] = vcc * (1. - u) + Vinhib[j] * u
 
+                        u = exp(-T_outSpike / (C_i * u2))  # e^{-T_{spike}A}
                         Vinhib[j] = vcc * (1. - u) + Vinhib[j] * u
 
                     # Also reset fireCond so it's ready for the next spike
@@ -1092,6 +1180,8 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                 inState[i] -= dt
                 # MUST be a while loop - T_outSpike can be comparatively large
                 while inState[i] <= 0.:
+                    if debugSpikes:
+                        debugEvents['in' + str(i) + 'spike'].append(t + dt + inState[i] - T_inSpike)
                     inState[i] += rand.get() * T_inGapRand[i] + T_inSpike
 
             # And update sim time so far
@@ -1141,6 +1231,162 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
             scipy.misc.imsave(self.debugSpikesTo[1].format(
                     self.debugInfo_.index), imgArr)
 
+            # Now plot the signal traces, with a helpful visualization.
+            show_img = True if nInputs == 4 else False
+            tot_ax = nInputs + nOutputs + (2 if show_img else 0)
+            norm_ax = nInputs + nOutputs
+            f, ax = plt.subplots(tot_ax, 1, sharex='all',
+                    sharey=False, figsize=(3.6, 0.5 + 0.35 * tot_ax),
+                    gridspec_kw=dict(wspace=0, hspace=0))
+
+            n_slots = 0
+            for v in debugEvents['volt']:
+                n_slots += v.shape[0]
+            times = np.arange(n_slots) * debugEventResolution
+            data = np.zeros((nInputs + nOutputs, n_slots))
+            n_slot = 0
+            for v in debugEvents['volt']:
+                for i in range(nInputs):
+                    data[i, n_slot:n_slot + v.shape[0]] = v[:, i]
+                for j in range(nOutputs):
+                    data[nInputs + j, n_slot:n_slot + v.shape[0]] = v[:, nInputs + j]
+                n_slot += v.shape[0]
+            spikes = np.zeros((nInputs + nOutputs, n_slots))
+            spikes_cnt = np.zeros((nInputs + nOutputs + 1, n_slots))  # last is any output
+            for i in range(nInputs):
+                for t in debugEvents['in' + str(i) + 'spike']:
+                    spikes[i, (times >= t) & (times < t + self.algTInSpike)] = 1.
+                    spikes_cnt[i, np.searchsorted(times, t)] += 1
+            spikesAny = np.zeros(n_slots)
+            for j in range(nOutputs):
+                for t in debugEvents['out' + str(j) + 'spike']:
+                    spikes[nInputs + j, (times >= t) & (times < t + self.algTOutSpike)] = 1.
+                    spikes_cnt[nInputs + j, np.searchsorted(times, t)] += 1
+                    spikes_cnt[nInputs + nOutputs, np.searchsorted(times, t)] += 1
+                spikesAny += spikes[nInputs + j]
+
+            # Mask out any input spikes occurring during an output spike
+            for i in range(nInputs):
+                spikes[i] *= 1 - np.clip(spikesAny, 0, 1)
+
+            # Change spikes to a boolean array so matplotlib can render
+            spikes = np.asarray(spikes, dtype=bool)
+
+            # Plot in ns
+            times *= 1e9
+            for axx in ax:
+                xmn = 0
+                if show_img:
+                    xmn = -1
+                axx.set_xlim(xmn, times[times.shape[0]-1])
+                axx.set_yticks([])
+                axx.yaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter('%.2f'))
+                axx.grid('on', linestyle='--', axis='x')
+
+            ax[1].set_yticks([inhib_vThresh])
+            ax[norm_ax-1].set_yticks([vFire])
+
+            ax[tot_ax-1].set_xlabel('Time (ns)')
+            ax[norm_ax//2].set_ylabel('Voltage (V)')
+            for i in range(nInputs):
+                ax[i].plot(times, data[i])
+                ax[i].plot(times, (inhib_vThresh,) * len(times), linestyle='--')
+                ax[i].set_ylim(*ax[i].get_ylim())  # bug workaround
+                mn, mx = ax[i].get_ylim()
+                mn -= 0.01
+                mx += 0.01
+                ax[i].set_ylim(mn, mx)
+                trans = ax[i].get_xaxis_transform()
+                ax[i].fill_between(times, 0, 1, where=spikes[i], facecolor='black', alpha=0.25, transform=trans)
+                for j in range(nOutputs):
+                    ax[i].fill_between(times, 0, 1, where=spikes[nInputs + j], facecolor='red', alpha=0.25, transform=trans)
+            for j in range(nOutputs):
+                i = nInputs + j
+                ax[i].plot(times, data[i])
+                ax[i].plot(times, (vFire,) * len(times), linestyle='--', color='green')
+                ax[i].set_ylim(*ax[i].get_ylim())  # bug workaround
+                mn, mx = ax[i].get_ylim()
+                mn = 0.
+                mx += 0.01
+                ax[i].set_ylim(mn, mx)
+                trans = ax[i].get_xaxis_transform()
+                ax[i].fill_between(times, 0, 1, where=spikes[i], facecolor='black', alpha=0.25, transform=trans)
+
+            if show_img:
+                # Use images to demonstrate functionality
+                ims = [matplotlib.image.imread('debug_gfx/{}.png'.format(i))
+                        for i in range(nInputs)]
+                im1 = ax[len(ax) - 2]
+                im2 = ax[len(ax) - 1]
+
+                imargs = dict(interpolation='none', aspect='auto')
+
+                # Show templates
+                for i in range(nInputs):
+                    _add_text(ax[i], 'In{}'.format(i))
+                    ymn, ymx = ax[i].get_ylim()
+                    im = ax[i].imshow(ims[i], extent=(-1, 0, ymn, ymx),
+                            **imargs)
+                    ax[i].set_ylim(ymn, ymx)
+                for j in range(nOutputs):
+                    _add_text(ax[nInputs + j], 'Out{}'.format(j))
+                    ymn, ymx = ax[nInputs + j].get_ylim()
+                    for i in range(nInputs):
+                        ax[nInputs + j].imshow(ims[i], extent=(-1, 0, ymn, ymx),
+                                alpha=crossbar[i, j], **imargs)
+
+                _add_text(ax[nInputs + nOutputs], 'Reconstruction')
+                for i in range(nInputs):
+                    ax[nInputs + nOutputs].imshow(ims[i], extent=(-1, 0, 0, 1),
+                            alpha=x[i], **imargs)
+
+                _add_text(ax[nInputs + nOutputs + 1], 'Inputs Seen')
+
+                # Assuming linear, know that a value of 1. expects a spike
+                # every T_inSpike / K_maxIn.
+                spikes_cnt = spikes_cnt.cumsum(1)
+
+                t = times[0]
+                img_times = np.linspace(
+                        (len(times)-1) * 0.5 / 10,
+                        (len(times)-1) * 9.5 / 10,
+                        10, dtype=int)
+                last_ins = np.zeros(nInputs)
+                for m, j in enumerate(img_times):
+                    # left, right, bottom, top
+                    t = times[j]
+                    u = t - times[img_times[0]]
+                    extent = (u, u + times[img_times[1]] - times[img_times[0]], 0, 1)
+
+                    # Data going in to each output spike.
+                    j_last = np.searchsorted(spikes_cnt[nInputs + nOutputs], m)
+                    # Skip over activity
+                    j_last += int(self.algTOutSpike / debugEventResolution)
+                    j_this = np.searchsorted(spikes_cnt[nInputs + nOutputs], m+1)
+                    for i in range(nInputs):
+                        dt = (j_this - j_last) * debugEventResolution
+                        # seconds of spike activity
+                        act = (spikes[i, j_last:j_this] * debugEventResolution).sum()
+                        # expected seconds of spike activity for a 1.0 input
+                        ex = max(1e-16, T_inSpike * dt / (T_inSpike / K_maxIn))
+                        #print(f'{i} @ {m} / {dt}: {act} / {ex}')
+                        im2.imshow(ims[i], alpha=act / ex, extent=extent,
+                                **imargs)
+
+                    # Reconstruction at time t.
+                    for i in range(nInputs):
+                        u = 0.
+                        for k in range(nOutputs):
+                            u += spikes_cnt[nInputs + k, j] * crossbar[i, k]
+                        u *= (self.algTOutAccum + self.algTOutSpike) / (1e-20 + t * 1e-9)
+                        im1.imshow(ims[i], alpha=u, extent=extent, **imargs)
+
+            fname = self.debugSpikesTo[1].format(str(self.debugInfo_.index) + '_signal')
+            if fname.endswith('.png'):
+                fname = fname[:len(fname)-4] + '.pdf'
+            plt.tight_layout(pad=0)
+            plt.savefig(fname)
+
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -1151,4 +1397,12 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
         for j in range(nOutputs):
             for i in range(nInputs):
                 r[i] += self._lcaInternal_crossbar[i, j] * y[j]
+
+
+def _add_text(ax, text):
+    """Helper."""
+    ax.text(-0.93, 0.935, text, color='white',
+        verticalalignment='top', transform=ax.get_xaxis_transform())
+    ax.text(-0.95, 0.95, text, color='black',
+            verticalalignment='top', transform=ax.get_xaxis_transform())
 
