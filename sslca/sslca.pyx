@@ -1365,8 +1365,9 @@ cdef class LcaSpikingWoodsAnalyticalInhibition(SklearnModelBase):
                     j_this = np.searchsorted(spikes_cnt[nInputs + nOutputs], m+1)
                     for i in range(nInputs):
                         dt = (j_this - j_last) * debugEventResolution
-                        # seconds of spike activity
-                        act = (spikes[i, j_last:j_this] * debugEventResolution).sum()
+                        # seconds of spike activity, IGNORING INHIBITION!!
+                        not_inhib = (data[i, j_last:j_this] < inhib_vThresh)
+                        act = (spikes[i, j_last:j_this] * not_inhib * debugEventResolution).sum()
                         # expected seconds of spike activity for a 1.0 input
                         ex = max(1e-16, T_inSpike * dt / (T_inSpike / K_maxIn))
                         #print(f'{i} @ {m} / {dt}: {act} / {ex}')
